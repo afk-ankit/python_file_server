@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-import os
 import argparse
-import math
-import paramiko
 import concurrent.futures
-import time
-from tqdm import tqdm
 import hashlib
+import math
+import os
+import threading
+import time
+
+import paramiko
+
+# Create a global progress dictionary to track individual chunks' progress
+chunk_progress = {}
+progress_lock = threading.Lock()
 
 
 def split_file(file_path, chunk_size_mb=50):
@@ -39,9 +44,37 @@ def calculate_md5(file_path):
     return hash_md5.hexdigest()
 
 
+class ProgressCallback:
+    def __init__(self, chunk_file, file_size):
+        self.chunk_name = os.path.basename(chunk_file)
+        self.file_size = file_size
+        self.transferred = 0
+
+        # Initialize progress tracking for this chunk
+        with progress_lock:
+            chunk_progress[self.chunk_name] = {
+                'size': file_size,
+                'transferred': 0,
+                'percent': 0
+            }
+
+    def __call__(self, transferred, remaining):
+        # Update tracking information
+        self.transferred = transferred
+        percent = int(100 * transferred /
+                      self.file_size) if self.file_size > 0 else 0
+
+        # Update the global progress dictionary with thread safety
+        with progress_lock:
+            chunk_progress[self.chunk_name] = {
+                'size': self.file_size,
+                'transferred': transferred,
+                'percent': percent
+            }
+
+
 def transfer_chunk(args):
-    """Transfer a single chunk to the remote server.
-    Function signature modified to accept a single argument for compatibility with ProcessPoolExecutor."""
+    """Transfer a single chunk to the remote server with progress tracking."""
     chunk_file, hostname, username, port, password, remote_dir, use_key, key_path = args
 
     try:
@@ -66,12 +99,52 @@ def transfer_chunk(args):
             client.exec_command(command)
 
         remote_file = os.path.join(remote_dir, os.path.basename(chunk_file))
-        sftp.put(chunk_file, remote_file)
+
+        # Set up progress callback
+        file_size = os.path.getsize(chunk_file)
+        callback = ProgressCallback(chunk_file, file_size)
+
+        # Use the callback during transfer
+        sftp.put(chunk_file, remote_file, callback=callback)
+
         sftp.close()
         client.close()
         return True, chunk_file
     except Exception as e:
         return False, f"Error transferring chunk {chunk_file}: {str(e)}"
+
+
+def print_progress():
+    """Print progress of individual chunks periodically."""
+    while True:
+        # Clear screen (works in most terminals)
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        print("Current chunk transfer progress:")
+        print("-" * 60)
+
+        with progress_lock:
+            if not chunk_progress:  # If dictionary is empty
+                print("No transfers in progress...")
+            else:
+                # Sort chunks by name for consistent display
+                for chunk_name in sorted(chunk_progress.keys()):
+                    info = chunk_progress[chunk_name]
+                    progress_bar = '█' * \
+                        int(info['percent'] / 2) + '░' * \
+                        (50 - int(info['percent'] / 2))
+                    transferred_mb = info['transferred'] / (1024 * 1024)
+                    total_mb = info['size'] / (1024 * 1024)
+                    print(
+                        f"{chunk_name}: [{progress_bar}] {info['percent']}% ({transferred_mb:.2f}MB/{total_mb:.2f}MB)")
+
+        print("-" * 60)
+        time.sleep(0.5)  # Update every half second
+
+        # Exit if all transfers are complete
+        with progress_lock:
+            if not chunk_progress:
+                break
 
 
 def reassemble_chunks(hostname, username, port, password, remote_dir, original_file, use_key=False, key_path=None):
@@ -80,7 +153,7 @@ def reassemble_chunks(hostname, username, port, password, remote_dir, original_f
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        if use_key:
+        if use_key and key_path:
             key = paramiko.RSAKey.from_private_key_file(key_path)
             client.connect(hostname=hostname, username=username,
                            port=port, pkey=key)
@@ -166,22 +239,35 @@ def main():
             args.key
         ))
 
-    # Transfer chunks in parallel using processes
-    print("Transferring chunks in parallel using ProcessPoolExecutor...")
+    # Start progress display thread
+    progress_thread = threading.Thread(target=print_progress, daemon=True)
+    progress_thread.start()
+
+    # Transfer chunks in parallel
+    print("Transferring chunks in parallel...")
     start_time = time.time()
     results = []
 
-    # Use ProcessPoolExecutor instead of ThreadPoolExecutor
-    with concurrent.futures.ProcessPoolExecutor(max_workers=args.max_workers) as executor:
+    # Use ThreadPoolExecutor instead of ProcessPoolExecutor to allow shared memory
+    with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_workers) as executor:
         futures = [executor.submit(transfer_chunk, arg)
                    for arg in process_args]
 
-        # Show progress
-        with tqdm(total=len(chunks)) as pbar:
-            for future in concurrent.futures.as_completed(futures):
-                result = future.result()
-                results.append(result)
-                pbar.update(1)
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            results.append(result)
+
+            # Remove completed chunk from progress tracking
+            if result[0]:  # If transfer successful
+                chunk_name = os.path.basename(result[1])
+                with progress_lock:
+                    if chunk_name in chunk_progress:
+                        del chunk_progress[chunk_name]
+
+    # Ensure progress thread exits
+    with progress_lock:
+        chunk_progress.clear()
+    progress_thread.join(timeout=1.0)
 
     # Check for any failed transfers
     failed = [r for r in results if not r[0]]

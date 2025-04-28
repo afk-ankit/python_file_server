@@ -7,6 +7,12 @@ import concurrent.futures
 import time
 from tqdm import tqdm
 import hashlib
+import threading
+
+
+# Create a global progress dictionary to track individual chunks' progress
+chunk_progress = {}
+progress_lock = threading.Lock()
 
 
 def split_file(file_path, chunk_size_mb=50):
@@ -39,8 +45,37 @@ def calculate_md5(file_path):
     return hash_md5.hexdigest()
 
 
+class ProgressCallback:
+    def __init__(self, chunk_file, file_size):
+        self.chunk_name = os.path.basename(chunk_file)
+        self.file_size = file_size
+        self.transferred = 0
+
+        # Initialize progress tracking for this chunk
+        with progress_lock:
+            chunk_progress[self.chunk_name] = {
+                'size': file_size,
+                'transferred': 0,
+                'percent': 0
+            }
+
+    def __call__(self, transferred, remaining):
+        # Update tracking information
+        self.transferred = transferred
+        percent = int(100 * transferred /
+                      self.file_size) if self.file_size > 0 else 0
+
+        # Update the global progress dictionary with thread safety
+        with progress_lock:
+            chunk_progress[self.chunk_name] = {
+                'size': self.file_size,
+                'transferred': transferred,
+                'percent': percent
+            }
+
+
 def transfer_chunk(chunk_file, hostname, username, port, password, remote_dir, use_key=False, key_path=None):
-    """Transfer a single chunk to the remote server."""
+    """Transfer a single chunk to the remote server with progress tracking."""
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -63,14 +98,60 @@ def transfer_chunk(chunk_file, hostname, username, port, password, remote_dir, u
             client.exec_command(command)
 
         remote_file = os.path.join(remote_dir, os.path.basename(chunk_file))
-        # main transfer part
-        sftp.put(chunk_file, remote_file)
+
+        # Set up progress callback
+        file_size = os.path.getsize(chunk_file)
+        callback = ProgressCallback(chunk_file, file_size)
+
+        # Use the callback during transfer
+        sftp.put(chunk_file, remote_file, callback=callback)
+
         sftp.close()
         client.close()
+
+        # Mark complete in progress tracking
+        chunk_name = os.path.basename(chunk_file)
+        with progress_lock:
+            if chunk_name in chunk_progress:
+                del chunk_progress[chunk_name]
+
         return True
     except Exception as e:
         print(f"Error transferring chunk {chunk_file}: {str(e)}")
         return False
+
+
+def print_progress():
+    """Print progress of individual chunks periodically."""
+    while True:
+        # Clear screen (works in most terminals)
+        os.system('cls' if os.name == 'nt' else 'clear')
+
+        print("Current chunk transfer progress:")
+        print("-" * 60)
+
+        with progress_lock:
+            if not chunk_progress:  # If dictionary is empty
+                print("No transfers in progress...")
+            else:
+                # Sort chunks by name for consistent display
+                for chunk_name in sorted(chunk_progress.keys()):
+                    info = chunk_progress[chunk_name]
+                    progress_bar = '█' * \
+                        int(info['percent'] / 2) + '░' * \
+                        (50 - int(info['percent'] / 2))
+                    transferred_mb = info['transferred'] / (1024 * 1024)
+                    total_mb = info['size'] / (1024 * 1024)
+                    print(
+                        f"{chunk_name}: [{progress_bar}] {info['percent']}% ({transferred_mb:.2f}MB/{total_mb:.2f}MB)")
+
+        print("-" * 60)
+        time.sleep(0.5)  # Update every half second
+
+        # Check if we should exit the thread
+        with progress_lock:
+            if getattr(threading.current_thread(), "stop_flag", False):
+                break
 
 
 def reassemble_chunks(hostname, username, port, password, remote_dir, original_file, use_key=False, key_path=None):
@@ -88,7 +169,6 @@ def reassemble_chunks(hostname, username, port, password, remote_dir, original_f
                            port=port, password=password)
 
         remote_file = os.path.join(remote_dir, os.path.basename(original_file))
-        # chunks_dir = f"{original_file}_chunks"
 
         # Create reassembly script on remote server
         temp_script = "/tmp/reassemble_script.sh"
@@ -152,6 +232,11 @@ def main():
     split_time = time.time() - start_time
     print(f"File split into {len(chunks)} chunks in {split_time:.2f} seconds")
 
+    # Start progress display thread
+    progress_thread = threading.Thread(target=print_progress)
+    progress_thread.daemon = True  # Thread will exit when main thread exits
+    progress_thread.start()
+
     # Transfer chunks in parallel
     print("Transferring chunks in parallel...")
     start_time = time.time()
@@ -171,11 +256,19 @@ def main():
             )
             futures.append(future)
 
-        # Show progress
-        with tqdm(total=len(chunks)) as pbar:
-            for future in concurrent.futures.as_completed(futures):
-                print(time.time())
-                pbar.update(1)
+        # Track completion
+        completed = 0
+        total = len(chunks)
+        for future in concurrent.futures.as_completed(futures):
+            # Result can be ignored since we're already tracking progress
+            future.result()
+            completed += 1
+            print(
+                f"Overall progress: {completed}/{total} chunks completed ({int(completed/total*100)}%)")
+
+    # Signal the progress thread to stop
+    setattr(progress_thread, "stop_flag", True)
+    progress_thread.join(timeout=1.0)
 
     transfer_time = time.time() - start_time
     print(f"All chunks transferred in {transfer_time:.2f} seconds")
