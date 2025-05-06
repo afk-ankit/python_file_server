@@ -10,3 +10,4 @@ wheels/
 .venv
 .env
 downloadables/
+parallel_transfer.log
